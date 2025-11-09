@@ -146,6 +146,8 @@ jobs:
 
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
 
       - name: Add Rust Target
         run: rustup target add ${{ matrix.target }}
@@ -245,6 +247,8 @@ jobs:
 
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
 
       - name: Add Rust Target
         run: rustup target add ${{ matrix.target }}
