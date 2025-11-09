@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use smartstring::alias::String;
 use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt as _, ShortcutState};
 
 /// Enum representing all available hotkey functions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -274,7 +274,7 @@ impl Hotkey {
         );
 
         // Extract hotkeys data before async operations
-        let hotkeys = verge.data_arc().hotkeys.as_ref().cloned();
+        let hotkeys = verge.data_arc().hotkeys.clone();
 
         if let Some(hotkeys) = hotkeys {
             logging!(
