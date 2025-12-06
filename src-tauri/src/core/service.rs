@@ -504,6 +504,7 @@ impl ServiceManager {
 
     pub async fn refresh(&mut self) -> Result<()> {
         let status = self.check_service_comprehensive().await;
+        self.0 = status.clone();
         logging_error!(Type::Service, self.handle_service_status(&status).await);
         Ok(())
     }
@@ -532,6 +533,7 @@ impl ServiceManager {
         match status {
             ServiceStatus::Ready => {
                 logging!(info, Type::Service, "服务就绪，直接启动");
+                self.0 = ServiceStatus::Ready;
             }
             ServiceStatus::NeedsReinstall | ServiceStatus::ReinstallRequired => {
                 logging!(info, Type::Service, "服务需要重装，执行重装流程");
