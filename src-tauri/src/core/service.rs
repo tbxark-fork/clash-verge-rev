@@ -37,6 +37,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "windows")]
+pub(crate) mod windows_fallback;
+
 static OWNER_MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SERVICE_SESSION: Lazy<Mutex<Option<ActiveServiceSession>>> = Lazy::new(|| Mutex::new(None));
 static PENDING_SERVICE_FALLBACK_NOTICE: AtomicBool = AtomicBool::new(false);
@@ -1351,8 +1354,9 @@ async fn sync_runtime_providers_by_service() -> Result<ProviderSync> {
                 logging!(
                     warn,
                     Type::Service,
-                    "provider cache {} was not read: {error:#}",
-                    declared.provider.destination
+                    "failed to read provider cache {} into {}: {error:#}",
+                    declared.provider.destination,
+                    temp.display()
                 );
                 outcome.pending += 1;
                 remove_temp(&temp).await;
@@ -1442,8 +1446,9 @@ async fn publish_fetched(
                 logging!(
                     warn,
                     Type::Service,
-                    "provider cache {} was not published: {error}",
-                    cache.declared.provider.destination
+                    "failed to rename provider cache {} to {}: {error}",
+                    cache.temp.display(),
+                    target.display()
                 );
                 remove_temp(&cache.temp).await;
             }
@@ -1587,7 +1592,9 @@ fn has_settled(mtime_ns: Option<u64>) -> bool {
 // Exclusive creation protects existing files from truncation and cleanup.
 async fn create_sync_temp(target: &Path) -> Result<(PathBuf, tokio::fs::File)> {
     if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create provider cache directory {}", parent.display()))?;
     }
     let name = target
         .file_name()
@@ -1959,12 +1966,13 @@ async fn recover_after_owner_loss_while_locked(reason: OwnerRecoveryReason) {
 #[tracing::instrument(skip_all, level = "info", fields(attempts = tracing::field::Empty, interval_ms = tracing::field::Empty, outcome = tracing::field::Empty))]
 async fn wait_for_service_ipc() -> Result<()> {
     const CONTEXT: &str = "service IPC did not become available";
-    let config = ServiceManager::config();
+    const READY_ATTEMPTS: usize = 61;
+    const READY_INTERVAL: Duration = Duration::from_millis(500);
     let span = tracing::Span::current();
-    span.record("attempts", config.max_retries);
-    span.record("interval_ms", config.retry_delay.as_millis() as u64);
+    span.record("attempts", READY_ATTEMPTS);
+    span.record("interval_ms", READY_INTERVAL.as_millis() as u64);
 
-    match RUN_STATE.await_ready(config.max_retries, config.retry_delay).await {
+    match RUN_STATE.await_ready(READY_ATTEMPTS, READY_INTERVAL).await {
         Ok(_) => {
             tracing::Span::current().record("outcome", "ready");
             Ok(())
