@@ -105,7 +105,7 @@ async fn chain_item_or_default(item: Option<&PrfItem>, default_item: impl FnOnce
     }
 }
 
-async fn get_config_values() -> ConfigValues {
+async fn get_config_values(profile_uid: &str) -> ConfigValues {
     let clash = Config::clash().await;
     let clash_arc = clash.latest_arc();
     let clash_config = clash_arc.0.clone();
@@ -120,12 +120,12 @@ async fn get_config_values() -> ConfigValues {
         ref enable_builtin_enhanced,
         ref verge_socks_enabled,
         ref verge_http_enabled,
-        ref enable_dns_settings,
         ref enable_external_controller,
         ..
     } = **verge_arc;
     let enable_external_controller = enable_external_controller.unwrap_or(false);
-    let dns_override_confirmation = verge_arc.dns_override_confirmation.clone();
+    let dns_settings = verge_arc.dns_settings_for(profile_uid);
+    let dns_override_confirmation = dns_settings.confirmation;
 
     let (clash_core, enable_tun, enable_builtin, socks_enabled, http_enabled, enable_dns_settings) = (
         Some(verge_arc.get_valid_clash_core()),
@@ -133,7 +133,7 @@ async fn get_config_values() -> ConfigValues {
         enable_builtin_enhanced.unwrap_or(true),
         verge_socks_enabled.unwrap_or(false),
         verge_http_enabled.unwrap_or(false),
-        enable_dns_settings.unwrap_or(false),
+        dns_settings.enabled,
     );
 
     #[cfg(not(target_os = "windows"))]
@@ -873,7 +873,8 @@ async fn apply_dns_settings(config: Mapping, enable_dns_settings: bool) -> (Mapp
 pub async fn enhance(
     profiles: &IProfiles,
 ) -> Result<(Mapping, HashSet<String>, HashMap<String, ResultLog>, DnsOverrideState)> {
-    let cfg_vals = get_config_values().await;
+    let profile_uid = profiles.current.as_deref().unwrap_or_default();
+    let cfg_vals = get_config_values(profile_uid).await;
     let ConfigValues {
         clash_config,
         clash_core,
@@ -892,7 +893,8 @@ pub async fn enhance(
 
     let profile = collect_profile_items(profiles).await?;
     let dns_override = DnsOverrideState::new(
-        dns_override_source(profiles.current.as_deref().unwrap_or_default(), &profile.config)?,
+        profile_uid,
+        dns_override_source(profile_uid, &profile.config)?,
         enable_dns_settings,
         dns_override_confirmation,
     );
@@ -1431,6 +1433,38 @@ mod tests {
 
     fn mapping(yaml: &str) -> serde_yaml_ng::Mapping {
         serde_yaml_ng::from_str(yaml).expect("test config should be valid")
+    }
+
+    #[test]
+    fn merge_replaces_dns_fields_with_or_without_dns_settings() {
+        let profile = mapping(
+            "dns: {nameserver: [9.9.9.9], nameserver-policy: {profile.example: 9.9.9.9}}\n\
+             hosts: {profile.example: 192.0.2.1}",
+        );
+        let settings = mapping(
+            "dns: {ipv6: true, nameserver: [8.8.8.8], nameserver-policy: {settings.example: 8.8.8.8}}\n\
+             hosts: {settings.example: 192.0.2.2}",
+        );
+        let merge = mapping(
+            "dns: {ipv6: false, nameserver-policy: {merge.example: 1.1.1.1}}\n\
+             hosts: {merge.example: 192.0.2.3}",
+        );
+
+        for enabled in [false, true] {
+            let (config, owns_ipv6) = if enabled {
+                super::merge_dns_config(profile.clone(), settings.clone())
+            } else {
+                (profile.clone(), false)
+            };
+            let authoritative = AuthoritativeFields::capture(&config, &[], owns_ipv6);
+            let result = authoritative.enforce(super::use_merge(&merge, config));
+
+            assert_eq!(result["dns"]["nameserver-policy"], merge["dns"]["nameserver-policy"]);
+            assert_eq!(result["hosts"], merge["hosts"]);
+            let source = if enabled { &settings } else { &profile };
+            assert_eq!(result["dns"]["nameserver"], source["dns"]["nameserver"]);
+            assert_eq!(result["dns"]["ipv6"], serde_yaml_ng::Value::from(enabled));
+        }
     }
 
     #[tokio::test]
