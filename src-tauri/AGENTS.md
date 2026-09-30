@@ -25,8 +25,16 @@ These rules supplement the repository's root `AGENTS.md`.
    use `Arc<str>` for notice message payloads. Preserve the eleven event names
    and all 41 status strings, including `info`, in the golden tests. Status
    additions or changes require frontend and backend changes in the same PR and
-   an updated golden list; this protects the wire contract. No exceptions.
-5. **Preserve lock order.** The order is `config_write` before
+    an updated golden list; this protects the wire contract. No exceptions.
+
+    Known dead wire entries, recorded here and intentionally kept (no tracking
+    issue): six `config_validate::*` statuses whose frontend handlers never
+    receive a backend send (`core_change`, `stdout_error`, `yaml_key_error`,
+    `yaml_error`, `merge_key_error`, `merge_error`), and `set_config::ok`,
+    sent by the backend with no frontend handler. Each variant carries its own
+    comment in `NoticeStatus`. Removal requires a same-PR frontend change and a
+    golden-list update.
+ 5. **Preserve lock order.** The order is `config_write` before
    `config_update_in_progress` before `lifecycle_lock`. Patch callers must use
    the executor's guarded claim instead of independently combining these locks;
    this preserves Busy rejection and prevents inverted acquisition. Existing
