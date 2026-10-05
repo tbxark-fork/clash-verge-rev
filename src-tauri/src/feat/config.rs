@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, IVerge},
-    core::{CoreManager, autostart, handle, hotkey, logger, proxy_control, tray},
+    core::{CoreManager, SilentUpdater, autostart, handle, hotkey, logger, proxy_control, tray},
     module::{auto_backup::AutoBackupManager, lightweight},
 };
 use anyhow::Result;
@@ -317,6 +317,9 @@ pub(super) async fn apply_verge_patch_locked(
         // 分离数据获取和异步调用
         let verge_data = verge.data_arc();
         verge_data.save_file().await?;
+    }
+    if patch.auto_check_update == Some(false) {
+        SilentUpdater::delete_cache();
     }
     Ok(())
 }
