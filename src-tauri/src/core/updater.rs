@@ -83,7 +83,7 @@ impl SilentUpdater {
         Ok(serde_json::from_str(&content)?)
     }
 
-    fn delete_cache() {
+    pub fn delete_cache() {
         if let Ok(cache_dir) = Self::cache_dir()
             && cache_dir.exists()
         {
@@ -150,6 +150,11 @@ fn nsis_language_id(app_language: &str) -> &'static str {
 impl SilentUpdater {
     /// Installs a newer cached update before normal startup, if the user confirms.
     pub async fn try_install_on_startup(&self, app_handle: &tauri::AppHandle) -> bool {
+        if !Config::verge().await.latest_arc().auto_check_update.unwrap_or(true) {
+            Self::delete_cache();
+            return false;
+        }
+
         let current_version = env!("CARGO_PKG_VERSION");
 
         let meta = match Self::read_cache_meta() {
@@ -470,9 +475,21 @@ impl SilentUpdater {
             )
             .await?;
 
+        let config_write = Config::lock_config_write().await;
+        let auto_check = Config::verge().await.latest_arc().auto_check_update.unwrap_or(true);
+        if !auto_check {
+            logging!(
+                info,
+                Type::System,
+                "Silent updater: discarding download because auto check was disabled"
+            );
+            return Ok(());
+        }
+
         if let Err(e) = Self::write_cache(&bytes, &version) {
             logging!(warn, Type::System, "Silent updater: failed to write cache: {e:#}");
         }
+        drop(config_write);
 
         *self.pending_bytes.write() = Some(bytes);
         *self.pending_update.write() = Some(update);
