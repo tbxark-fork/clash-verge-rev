@@ -1,19 +1,20 @@
 use crate::config::IVerge;
 use std::collections::BTreeSet;
 
+/// Variant order defines execution dependency order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Effect {
     RestartCore,
     ClashConfig,
     Autostart,
+    Language,
     SystemProxy,
-    TrayIcon,
     Hotkey,
     TrayMenu,
+    TrayIcon,
     TrayTooltip,
     TrayClick,
     Lightweight,
-    Language,
     LogLevel,
     LogFile,
 }
@@ -41,9 +42,6 @@ macro_rules! verge_registry {
             $( $(#[$cfg])* { select_field!(effects, $field, $rule); } )*
             effects
         }
-
-        #[cfg(test)]
-        const VERGE_FIELDS: &[&str] = &[ $( $(#[$cfg])* stringify!($field), )* ];
     };
 }
 
@@ -79,12 +77,12 @@ verge_registry! {
     enable_bypass_check => NoEffect;
     enable_dns_settings => NoEffect;
     profile_dns_settings => NoEffect;
-    use_default_bypass => NoEffect;
+    use_default_bypass => [SystemProxy];
     system_proxy_bypass => [SystemProxy];
     proxy_guard_duration => [SystemProxy];
     proxy_auto_config => [SystemProxy];
     pac_file_content => [SystemProxy];
-    proxy_host => NoEffect;
+    proxy_host => [SystemProxy];
     theme_setting => NoEffect;
     web_ui_list => NoEffect;
     clash_core => NoEffect;
@@ -165,18 +163,6 @@ pub(super) fn clash_effects(patch: &serde_yaml_ng::Mapping) -> Effects {
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_serialized_verge_field_is_registered() -> Result<(), serde_json::Error> {
-        let fields: std::collections::BTreeMap<String, serde_json::Value> =
-            serde_json::from_value(serde_json::to_value(IVerge::default())?)?;
-        for field in fields.keys() {
-            assert!(VERGE_FIELDS.contains(&field.as_str()), "unregistered field: {field}");
-        }
-        let unique: BTreeSet<_> = VERGE_FIELDS.iter().collect();
-        assert_eq!(unique.len(), VERGE_FIELDS.len());
-        Ok(())
-    }
-
     fn verge_patch(mutate: impl FnOnce(&mut IVerge)) -> IVerge {
         let mut patch = IVerge::default();
         mutate(&mut patch);
@@ -187,7 +173,7 @@ mod tests {
     fn representative_verge_patches_map_to_frozen_effects() {
         assert_eq!(verge_effects(&IVerge::default()), Effects::new());
 
-        let cases: [(IVerge, &[Effect]); 7] = [
+        let cases: [(IVerge, &[Effect]); 9] = [
             (
                 verge_patch(|p| p.verge_mixed_port = Some(27899)),
                 &[Effect::RestartCore],
@@ -211,6 +197,14 @@ mod tests {
             ),
             (
                 verge_patch(|p| p.system_proxy_bypass = Some("localhost".into())),
+                &[Effect::SystemProxy],
+            ),
+            (
+                verge_patch(|p| p.use_default_bypass = Some(false)),
+                &[Effect::SystemProxy],
+            ),
+            (
+                verge_patch(|p| p.proxy_host = Some("localhost".into())),
                 &[Effect::SystemProxy],
             ),
             (

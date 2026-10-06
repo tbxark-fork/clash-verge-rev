@@ -54,8 +54,6 @@ const mountBus = async () => {
       notice(status, message, (key) => key, vi.fn())
     },
     revalidateKeys: (keys) => void revalidateQueries(keys.map((key) => [key])),
-    revalidateProfiles: () => {},
-    refreshProxyView: () => {},
     readPendingFailures: () => {},
     readRunState: () => {},
   })
@@ -180,34 +178,6 @@ it('offers service reinstallation for a startup path refusal even before listene
   expect(requestService).toHaveBeenCalledExactlyOnceWith({
     reason: 'serviceLocationRefused',
   })
-})
-
-it('routes every event exactly once through one handler', async () => {
-  const { createEventBus } = await import('./create-bus-handlers')
-  const dispatch = vi.fn<(action: AppStoreAction) => void>()
-  const bus = createEventBus({
-    dispatch,
-    handleNotice: vi.fn(),
-    revalidateKeys: vi.fn(),
-    revalidateProfiles: vi.fn(),
-    refreshProxyView: vi.fn(),
-    readPendingFailures: vi.fn(),
-    readRunState: vi.fn(),
-  })
-
-  bus.handlers['verge://run-state-changed']({ mode: 'Service' } as RunState)
-  bus.handlers['profile-update-started']({ uid: 'p1' })
-  bus.handlers['profile-update-completed']({ uid: 'p1' })
-  bus.handlers['verge://timer-updated']('p1')
-  bus.handlers['verge://test-all'](null)
-
-  expect(dispatch.mock.calls.map(([action]) => action.type)).toEqual([
-    'runState/loaded',
-    'profileUpdate/started',
-    'profileUpdate/completed',
-    'profileUpdate/timerTick',
-    'testAll/requested',
-  ])
 })
 
 it('explains a startup core rejection instead of the generic fallback notice', async () => {

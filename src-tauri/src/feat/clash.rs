@@ -11,8 +11,7 @@ use bytes::BytesMut;
 use clash_verge_logging::{Type, logging};
 use serde_yaml_ng::{Mapping, Value};
 use smartstring::alias::String;
-use std::sync::Arc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 #[allow(clippy::expect_used)]
 static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
@@ -54,6 +53,19 @@ pub async fn restart_app() {
 
     if !cleanup_result.core_stopped {
         handle::Handle::global().clear_is_exiting();
+        // A failed stop may still have marked the core stopped, and exit cleanup skipped the DNS restore.
+        // A core that kept running keeps its DNS, whatever an unapplied config draft says.
+        #[cfg(target_os = "macos")]
+        {
+            let manager = CoreManager::global();
+            let _lifecycle = manager.lifecycle_lock.lock().await;
+            if matches!(
+                *manager.get_running_mode(),
+                crate::core::manager::RunningMode::NotRunning
+            ) {
+                crate::utils::resolve::dns::sync_public_dns().await;
+            }
+        }
         handle::Handle::notice(
             NoticeStatus::AppRestartCoreStopFailed,
             cleanup_result.stop_error.unwrap_or_default(),
