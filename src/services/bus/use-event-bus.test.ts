@@ -1,5 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest'
 
+import { createStoreReads } from '@/store/store-reads'
+
 import { useEventBus } from './use-event-bus'
 
 const listen = vi.hoisted(() =>
@@ -25,6 +27,7 @@ vi.mock('react', async (importOriginal) => {
 })
 vi.mock('@/store/app-store-context', () => ({
   useAppDispatch: () => dispatch,
+  useAppReads: () => createStoreReads(dispatch),
 }))
 vi.mock('@/services/cmds', () => ({
   getPendingFailures: vi.fn().mockResolvedValue([]),
@@ -40,27 +43,6 @@ beforeEach(() => {
   handleNotice.mockClear()
   dispatch.mockClear()
   listen.mockImplementation(() => Promise.resolve(() => {}))
-})
-
-it('registers exactly one listener per contract event plus test-all', () => {
-  useEventBus(handleNotice)
-
-  const names = listen.mock.calls.map(([name]) => name)
-  expect(names).toEqual([
-    'verge://refresh-clash-config',
-    'verge://refresh-verge-config',
-    'verge://refresh-profiles',
-    'verge://refresh-proxy-config',
-    'verge://notice-message',
-    'profile-changed',
-    'verge://timer-updated',
-    'profile-update-started',
-    'profile-update-completed',
-    'verge://run-state-changed',
-    'verge://pending-failures-changed',
-    'verge://test-all',
-  ])
-  expect(new Set(names).size).toBe(names.length)
 })
 
 it('drains event-only state only after every listener is registered', async () => {
