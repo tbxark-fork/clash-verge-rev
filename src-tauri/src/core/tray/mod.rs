@@ -1,4 +1,4 @@
-use crate::config::{IProfilePreview, IVerge};
+use crate::config::{IProfilePreview, IProfiles, IVerge};
 use crate::core::lightweight;
 use crate::core::proxy_view::{ProxyGroupView, ProxyMemberRef, ProxyNodeSource, ProxyViewProviderState, ProxyViewV1};
 use crate::core::tray::menu_def::TrayAction;
@@ -42,7 +42,8 @@ const TRAY_CLICK_DEBOUNCE_MS: u64 = 300;
 pub const TRAY_ID: &str = "clash-verge-rev-tray";
 
 #[derive(Clone, Copy)]
-struct TrayMenuOptions {
+struct TrayMenuOptions<'a> {
+    mode: Option<&'a str>,
     is_lightweight_mode: bool,
     include_proxy_groups: bool,
 }
@@ -223,9 +224,8 @@ impl Tray {
         };
 
         let verge = Config::verge().await.latest_arc();
-        let system_proxy = verge.enable_system_proxy.as_ref().unwrap_or(&false);
-        let tun_mode = verge.enable_tun_mode.as_ref().unwrap_or(&false);
-        let tun_mode_available = crate::core::runstate::RUN_STATE.state().tun_capable();
+        let system_proxy = verge.enable_system_proxy.unwrap_or(false);
+        let tun_mode = verge.enable_tun_mode.unwrap_or(false);
         let mode = {
             Config::clash()
                 .await
@@ -236,30 +236,59 @@ impl Tray {
                 .unwrap_or("rule")
                 .to_owned()
         };
-        let profiles_config = Config::profiles().await;
-        let profiles_arc = profiles_config.latest_arc();
-        let profiles_preview = profiles_arc.profiles_preview().unwrap_or_default();
         let is_lightweight_mode = is_in_lightweight_mode();
 
-        let (menu, latency_items) = create_tray_menu(
-            app_handle,
-            Some(mode.as_str()),
-            *system_proxy,
-            *tun_mode,
-            tun_mode_available,
-            profiles_preview,
-            TrayMenuOptions {
-                is_lightweight_mode,
-                include_proxy_groups,
-            },
-        )
-        .await?;
-        tray.set_menu(Some(menu))?;
-        let groups: Vec<_> = latency_items.keys().cloned().collect();
-        *self.latency_items.lock() = latency_items;
-        for group in groups {
-            self.refresh_latency_item(&group);
-        }
+        // Proxy data must remain optional so a stopped Core cannot roll back unrelated settings.
+        let fetch_proxy_groups =
+            include_proxy_groups && verge.tray_proxy_groups_display_mode.as_deref() != Some("disable");
+        let proxy_view = if fetch_proxy_groups {
+            tokio::time::timeout(
+                Duration::from_millis(1000),
+                cmd::proxy::proxy_view(Some(Duration::from_millis(750))),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+        } else {
+            None
+        };
+        let verge = if fetch_proxy_groups {
+            Config::verge().await.latest_arc()
+        } else {
+            verge
+        };
+        let profiles = Config::profiles().await.latest_arc();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let dispatch_handle = app_handle.clone();
+        app_handle
+            .run_on_main_thread(move || {
+                let _ = tx.send((|| -> Result<()> {
+                    let (menu, latency_items) = build_tray_menu(
+                        &dispatch_handle,
+                        system_proxy,
+                        tun_mode,
+                        TrayMenuOptions {
+                            mode: Some(mode.as_str()),
+                            is_lightweight_mode,
+                            include_proxy_groups,
+                        },
+                        &verge,
+                        &profiles,
+                        proxy_view,
+                    )?;
+                    tray.set_menu(Some(menu))?;
+                    let groups: Vec<_> = latency_items.keys().cloned().collect();
+                    *Self::global().latency_items.lock() = latency_items;
+                    for group in &groups {
+                        Self::global().refresh_latency_item_on_main_thread(group);
+                    }
+                    Ok(())
+                })());
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to dispatch tray menu update: {e}"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Tray menu update returned no result"))??;
 
         logging!(debug, Type::Tray, "托盘菜单更新成功");
         Ok(())
@@ -790,39 +819,17 @@ fn create_proxy_menu_item(
     Ok((proxies_submenu, inline_proxy_items))
 }
 
-async fn create_tray_menu(
+fn build_tray_menu(
     app_handle: &AppHandle,
-    mode: Option<&str>,
     system_proxy_enabled: bool,
     tun_mode_enabled: bool,
-    tun_mode_available: bool,
-    profiles_preview: Vec<IProfilePreview<'_>>,
-    options: TrayMenuOptions,
+    options: TrayMenuOptions<'_>,
+    verge_settings: &IVerge,
+    profiles_config: &IProfiles,
+    proxy_view: Option<ProxyViewV1>,
 ) -> Result<(tauri::menu::Menu<Wry>, HashMap<std::string::String, LatencyMenuItem>)> {
-    let current_proxy_mode = mode.unwrap_or("");
-
-    let mut verge_settings = Config::verge().await.latest_arc();
-    let fetch_proxy_groups =
-        options.include_proxy_groups && verge_settings.tray_proxy_groups_display_mode.as_deref() != Some("disable");
-
-    // Proxy data must remain optional so a stopped Core cannot roll back unrelated settings.
-    let proxy_view = if fetch_proxy_groups {
-        tokio::time::timeout(
-            Duration::from_millis(1000),
-            cmd::proxy::proxy_view(Some(Duration::from_millis(750))),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-    } else {
-        None
-    };
-
-    if fetch_proxy_groups {
-        verge_settings = Config::verge().await.latest_arc();
-    }
-
-    let profiles_config = Config::profiles().await.latest_arc();
+    let current_proxy_mode = options.mode.unwrap_or("");
+    let tun_mode_available = crate::core::runstate::RUN_STATE.state().tun_capable();
 
     let tray_proxy_groups_display_mode = verge_settings
         .tray_proxy_groups_display_mode
@@ -836,7 +843,8 @@ async fn create_tray_menu(
 
     let hotkeys = create_hotkeys(&verge_settings.hotkeys);
 
-    let profile_menu_items: Vec<CheckMenuItem<Wry>> = create_profile_menu_item(app_handle, profiles_preview)?;
+    let profile_menu_items: Vec<CheckMenuItem<Wry>> =
+        create_profile_menu_item(app_handle, profiles_config.profiles_preview().unwrap_or_default())?;
 
     let texts = MenuTexts::new();
     let profile_menu_items_refs: Vec<&dyn IsMenuItem<Wry>> = profile_menu_items
@@ -917,8 +925,8 @@ async fn create_tray_menu(
             proxy_view,
             &mut latency_items,
             &texts,
-            &verge_settings,
-            &profiles_config,
+            verge_settings,
+            profiles_config,
         );
 
         match tray_proxy_groups_display_mode {
