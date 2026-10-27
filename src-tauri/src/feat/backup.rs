@@ -136,14 +136,35 @@ pub async fn delete_webdav_backup(filename: String) -> Result<()> {
     })
 }
 
+/// Backup creation strips the WebDAV credentials, so the live ones are kept.
+async fn restore_backup_archive(path: PathBuf) -> Result<()> {
+    let (webdav_url, webdav_username, webdav_password) = {
+        let verge = Config::verge().await;
+        let verge = verge.latest_arc();
+        (
+            verge.webdav_url.clone(),
+            verge.webdav_username.clone(),
+            verge.webdav_password.clone(),
+        )
+    };
+
+    let home_dir = app_home_dir()?;
+    AsyncHandler::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::File::open(&path)?;
+        let mut zip = zip::ZipArchive::new(file)?;
+        zip.extract(&home_dir)?;
+        Ok(())
+    })
+    .await
+    .map_err(|join| anyhow!("backup extraction task failed: {join}"))??;
+
+    // Held for the config-data transition only; extraction is plain filesystem work.
+    let _profile_write = crate::config::profiles::PROFILE_WRITE_LOCK.lock().await;
+    finalize_restored_verge_config(webdav_url, webdav_username, webdav_password).await
+}
+
 #[tracing::instrument(skip_all, level = "info", fields(filename = %filename))]
 pub async fn restore_webdav_backup(filename: String) -> Result<()> {
-    let verge = Config::verge().await;
-    let verge_data = verge.latest_arc();
-    let webdav_url = verge_data.webdav_url.clone();
-    let webdav_username = verge_data.webdav_username.clone();
-    let webdav_password = verge_data.webdav_password.clone();
-
     let backup_storage_path = app_home_dir()
         .map_err(|e| anyhow::anyhow!("Failed to get app home dir: {e}"))?
         .join(filename.as_str());
@@ -160,20 +181,7 @@ pub async fn restore_webdav_backup(filename: String) -> Result<()> {
             err
         })?;
 
-    let value = backup_storage_path.clone();
-    let home_dir = app_home_dir()?;
-    AsyncHandler::spawn_blocking(move || -> Result<()> {
-        let file = std::fs::File::open(&value)?;
-        let mut zip = zip::ZipArchive::new(file)?;
-        zip.extract(&home_dir)?;
-        Ok(())
-    })
-    .await
-    .map_err(|join| anyhow!("backup extraction task failed: {join}"))??;
-
-    // Held for the config-data transition only; extraction is plain filesystem work.
-    let _profile_write = crate::config::profiles::PROFILE_WRITE_LOCK.lock().await;
-    let res = finalize_restored_verge_config(webdav_url, webdav_username, webdav_password).await;
+    let res = restore_backup_archive(backup_storage_path.clone()).await;
     let _ = backup_storage_path.remove_if_exists().await;
     res
 }
@@ -342,30 +350,7 @@ pub async fn restore_local_backup(filename: String) -> Result<()> {
         return Err(anyhow!("Backup file not found: {}", filename));
     }
 
-    let (webdav_url, webdav_username, webdav_password) = {
-        let verge = Config::verge().await;
-        let verge = verge.latest_arc();
-        (
-            verge.webdav_url.clone(),
-            verge.webdav_username.clone(),
-            verge.webdav_password.clone(),
-        )
-    };
-
-    let home_dir = app_home_dir()?;
-    AsyncHandler::spawn_blocking(move || -> Result<()> {
-        let file = std::fs::File::open(&target_path)?;
-        let mut zip = zip::ZipArchive::new(file)?;
-        zip.extract(&home_dir)?;
-        Ok(())
-    })
-    .await
-    .map_err(|join| anyhow!("backup extraction task failed: {join}"))??;
-
-    // Held for the config-data transition only; extraction is plain filesystem work.
-    let _profile_write = crate::config::profiles::PROFILE_WRITE_LOCK.lock().await;
-    finalize_restored_verge_config(webdav_url, webdav_username, webdav_password).await?;
-    Ok(())
+    restore_backup_archive(target_path).await
 }
 
 #[tracing::instrument(skip_all, level = "info", fields(filename = %filename, destination = %destination))]
