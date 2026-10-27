@@ -33,6 +33,9 @@ async fn finalize_restored_verge_config(
     webdav_username: Option<String>,
     webdav_password: Option<String>,
 ) -> Result<()> {
+    // The lock must cover every restored layer; an unlocked apply races a concurrently staged draft.
+    let config_write = Config::lock_config_write().await;
+
     // A broken restored `verge.yaml` is a restore failure, not a reason to load defaults.
     let mut restored = help::read_yaml::<IVerge>(&verge_path()?).await?;
     restored.webdav_url = webdav_url;
@@ -43,42 +46,41 @@ async fn finalize_restored_verge_config(
     let restored_clash = IClashTemp::new().await;
     let clash_draft = Config::clash().await;
     clash_draft.edit_draft(|d| {
-        *d = restored_clash.clone();
+        *d = restored_clash;
     });
     clash_draft.apply();
 
     let restored_profiles = IProfiles::new().await;
     let profiles_draft = Config::profiles().await;
     profiles_draft.edit_draft(|d| {
-        *d = restored_profiles.clone();
+        *d = restored_profiles;
     });
     profiles_draft.apply();
 
     let verge_draft = Config::verge().await;
-    {
-        // Hold the write lock so a concurrent patch cannot stage a draft the proxy write reads.
-        let _config_write = Config::lock_config_write().await;
-        verge_draft.edit_draft(|d| {
-            *d = restored.clone();
-        });
-        verge_draft.apply();
+    verge_draft.edit_draft(|d| {
+        *d = restored.clone();
+    });
+    verge_draft.apply();
 
-        // Turn it off here; a failing core side effect below would otherwise skip this step.
-        if !restored.enable_system_proxy.unwrap_or_default() {
-            let result = async {
-                let _lifecycle = CoreManager::global().lifecycle_lock.lock().await;
-                proxy_control::apply().await?;
-                proxy_control::refresh_guard().await
-            }
-            .await;
-            if let Err(err) = result {
-                logging!(error, Type::Backup, "Failed to turn the system proxy off: {err:#}");
-                if SystemProxyStateUnknown::is_in(&err) {
-                    return Err(err);
-                }
+    // Turn it off here; a failing core side effect below would otherwise skip this step.
+    if !restored.enable_system_proxy.unwrap_or_default() {
+        let result = async {
+            let _lifecycle = CoreManager::global().lifecycle_lock.lock().await;
+            proxy_control::apply().await?;
+            proxy_control::refresh_guard().await
+        }
+        .await;
+        if let Err(err) = result {
+            logging!(error, Type::Backup, "Failed to turn the system proxy off: {err:#}");
+            if SystemProxyStateUnknown::is_in(&err) {
+                return Err(err);
             }
         }
     }
+
+    // `patch_verge` re-acquires the lock through `try_lock_config_write`.
+    drop(config_write);
 
     // Run configuration side effects without rewriting the already-restored file.
     if let Err(err) = super::patch_verge(&restored, true).await {
