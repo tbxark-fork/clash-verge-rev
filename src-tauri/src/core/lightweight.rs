@@ -89,11 +89,8 @@ static WINDOW_LISTENERS: Mutex<WindowListeners> = Mutex::new(WindowListeners {
 
 static TIMER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-static COUNTDOWN: LazyLock<Countdown<u64>> = LazyLock::new(|| {
-    let (countdown, driver) = countdown::new(prepare_countdown, enter_lightweight_on_timeout);
-    AsyncHandler::spawn(move || driver);
-    countdown
-});
+static COUNTDOWN: LazyLock<Countdown<u64>> =
+    LazyLock::new(|| AsyncHandler::start_driver(countdown::new(prepare_countdown, enter_lightweight_on_timeout)));
 
 #[inline]
 fn get_state() -> LightweightState {

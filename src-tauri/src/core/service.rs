@@ -16,10 +16,7 @@ use crate::{
         runtime_bundle::{GEO_ASSETS, RemoteProviderRef, collect_runtime_bundle, remote_providers_of},
         tray::Tray,
     },
-    process::{
-        AsyncHandler,
-        scheduled_task::{self, Mailbox, Next, ScheduledTask},
-    },
+    process::AsyncHandler,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use clash_verge_draft::Draft;
@@ -29,6 +26,7 @@ use clash_verge_service_ipc::{
     RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceErrorCode, ServiceStatusSnapshot,
     StageRuntimeOutcome, StartClashRequest, WriterConfig,
 };
+use clash_verge_task::scheduled_task::{self, Mailbox, Next, ScheduledTask};
 use clash_verge_task::watch_task;
 use parking_lot::Mutex;
 use std::{
@@ -841,8 +839,11 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-static PROVIDER_SYNC_REQUESTS: LazyLock<Arc<Mailbox<Option<Instant>>>> =
-    LazyLock::new(|| scheduled_task::spawn(ProviderSchedule::default(), |_| sync_runtime_providers_by_service()));
+static PROVIDER_SYNC_REQUESTS: LazyLock<Arc<Mailbox<Option<Instant>>>> = LazyLock::new(|| {
+    AsyncHandler::start_driver(scheduled_task::new(ProviderSchedule::default(), |_| {
+        sync_runtime_providers_by_service()
+    }))
+});
 static SYNC_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RUNTIME_PROVIDER_SYNC_ATTEMPTS: u32 = 4;
 const CONTENT_COMPARE_CHUNK: usize = 64 * 1024;

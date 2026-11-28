@@ -1,11 +1,12 @@
+use crate::process::AsyncHandler;
 use crate::{
     config::{Config, IVerge},
     feat::create_local_backup_with_namer,
-    process::scheduled_task::{self, Mailbox, Next, ScheduledTask},
     utils::dirs::local_backup_dir,
 };
 use anyhow::Result;
 use clash_verge_logging::{Type, logging};
+use clash_verge_task::scheduled_task::{self, Mailbox, Next, ScheduledTask};
 use std::{
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -116,7 +117,7 @@ impl BackupInput {
 }
 
 static BACKUP_REQUESTS: LazyLock<Arc<Mailbox<BackupInput>>> =
-    LazyLock::new(|| scheduled_task::spawn(BackupSchedule::default(), execute_backup));
+    LazyLock::new(|| AsyncHandler::start_driver(scheduled_task::new(BackupSchedule::default(), execute_backup)));
 
 pub(crate) async fn init() {
     let _write = Config::lock_config_write().await;

@@ -6,47 +6,21 @@
 use crate::{
     config::Config,
     core::{CoreManager, proxy_control},
-    process::scheduled_task::{self, Mailbox, Next, ScheduledTask},
+    process::AsyncHandler,
 };
 use clash_verge_logging::{Type, logging};
+use clash_verge_task::scheduled_task::{self, CoalescingJob};
 use parking_lot::Mutex;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use sysproxy::NetworkServiceMonitor;
-use tokio::time::Instant;
 
 static MONITOR: Mutex<Option<NetworkServiceMonitor>> = Mutex::new(None);
 
-static REAPPLY_REQUESTS: LazyLock<Arc<Mailbox<bool>>> =
-    LazyLock::new(|| scheduled_task::spawn(NetworkReapply::default(), |()| reapply()));
-
-#[derive(Default)]
-struct NetworkReapply {
-    pending: bool,
-}
-
-impl ScheduledTask for NetworkReapply {
-    type Input = bool;
-    type Work = ();
-    type Output = ();
-
-    fn on_input(&mut self, requested: bool, _: Instant) {
-        self.pending |= requested;
-    }
-
-    fn next(&mut self, _: Instant) -> Next<()> {
-        if std::mem::take(&mut self.pending) {
-            Next::Run(())
-        } else {
-            Next::Idle
-        }
-    }
-
-    fn finished(&mut self, (): (), result: std::thread::Result<()>, _: Instant) {
-        if result.is_err() {
-            logging!(error, Type::Core, "network proxy reapply panicked");
-        }
-    }
-}
+static REAPPLY: LazyLock<CoalescingJob> = LazyLock::new(|| {
+    AsyncHandler::start_driver(scheduled_task::coalescing(reapply, || {
+        logging!(error, Type::Core, "network proxy reapply panicked");
+    }))
+});
 
 pub fn is_armed() -> bool {
     MONITOR.lock().is_some()
@@ -56,7 +30,7 @@ pub fn is_armed() -> bool {
 /// appearing from here on is never missed.
 pub fn start() {
     match NetworkServiceMonitor::start(|| {
-        REAPPLY_REQUESTS.update(|pending| !std::mem::replace(pending, true));
+        REAPPLY.request();
     }) {
         Ok(monitor) => {
             *MONITOR.lock() = Some(monitor);

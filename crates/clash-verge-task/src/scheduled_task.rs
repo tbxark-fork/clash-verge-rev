@@ -92,3 +92,59 @@ where
         }
     }
 }
+
+/// A request to run a job with at most one pending successor.
+pub struct CoalescingJob(Arc<Mailbox<bool>>);
+
+impl CoalescingJob {
+    pub fn request(&self) {
+        self.0.update(|pending| !std::mem::replace(pending, true));
+    }
+}
+
+/// Reconcile on demand without interrupting work in progress.
+pub fn coalescing<Fut>(
+    mut execute: impl FnMut() -> Fut + Send + 'static,
+    on_panic: impl FnMut() + Send + 'static,
+) -> (CoalescingJob, impl Future<Output = ()> + Send + 'static)
+where
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (mailbox, driver) = new(
+        Reconcile {
+            pending: false,
+            on_panic,
+        },
+        move |()| execute(),
+    );
+    (CoalescingJob(mailbox), driver)
+}
+
+struct Reconcile<P> {
+    pending: bool,
+    on_panic: P,
+}
+
+impl<P: FnMut()> ScheduledTask for Reconcile<P> {
+    type Input = bool;
+    type Work = ();
+    type Output = ();
+
+    fn on_input(&mut self, input: bool, _: Instant) {
+        self.pending = input;
+    }
+
+    fn next(&mut self, _: Instant) -> Next<()> {
+        if std::mem::take(&mut self.pending) {
+            Next::Run(())
+        } else {
+            Next::Idle
+        }
+    }
+
+    fn finished(&mut self, (): (), result: std::thread::Result<()>, _: Instant) {
+        if result.is_err() {
+            (self.on_panic)();
+        }
+    }
+}

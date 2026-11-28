@@ -4,6 +4,11 @@ use tauri::{async_runtime, async_runtime::JoinHandle};
 pub struct AsyncHandler;
 
 impl AsyncHandler {
+    pub(crate) fn start_driver<H>((handle, driver): (H, impl Future<Output = ()> + Send + 'static)) -> H {
+        Self::spawn(move || driver);
+        handle
+    }
+
     #[inline]
     #[track_caller]
     pub fn spawn<F, Fut>(f: F) -> JoinHandle<()>
