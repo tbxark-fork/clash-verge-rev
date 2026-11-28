@@ -11,11 +11,18 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use clash_verge_logging::Type;
+use futures::{
+    FutureExt as _,
+    future::{Map, Shared},
+};
 use log::Level;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use tauri_plugin_mihomo::MihomoExt as _;
 use tauri_plugin_shell::ShellExt as _;
+use tauri_plugin_shell::process::CommandChild;
+use tokio::task::{JoinError, JoinHandle};
 
 pub(super) fn explain_core_occupancy(error: anyhow::Error) -> anyhow::Error {
     let detail = error.to_string();
@@ -130,8 +137,34 @@ where
     .context("Mihomo API did not become ready")
 }
 
-fn should_clear_terminated_sidecar(running_mode: &RunningMode, current_pid: Option<u32>, terminated_pid: u32) -> bool {
-    matches!(running_mode, RunningMode::Sidecar) && current_pid == Some(terminated_pid)
+fn should_clear_terminated_sidecar(
+    running_mode: &RunningMode,
+    current_generation: Option<u64>,
+    terminated_generation: u64,
+) -> bool {
+    matches!(running_mode, RunningMode::Sidecar) && current_generation == Some(terminated_generation)
+}
+
+type ShareExitResult = fn(Result<(), JoinError>) -> Result<(), Arc<JoinError>>;
+type SidecarExit = Shared<Map<JoinHandle<()>, ShareExitResult>>;
+
+fn share_exit(exit: JoinHandle<()>) -> SidecarExit {
+    let share_error: ShareExitResult = |result| result.map_err(Arc::new);
+    exit.map(share_error).shared()
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SidecarSession {
+    process: Option<SidecarProcess>,
+    exit: Option<SidecarExit>,
+}
+
+#[derive(Debug)]
+struct SidecarProcess {
+    generation: u64,
+    child: CommandChild,
+    #[cfg(target_os = "windows")]
+    job: OwnedHandle,
 }
 
 #[cfg(target_os = "windows")]
@@ -218,7 +251,8 @@ impl CoreManager {
             )
         })?;
         let (terminated, termination) = tokio::sync::oneshot::channel();
-        *self.sidecar_exit.lock().await = Some(execution.release_after_exit(child.pid(), termination));
+        let exit = execution.release_after_exit(child.pid(), termination);
+        self.sidecar.lock().exit = Some(share_exit(exit));
         #[cfg(target_os = "windows")]
         let job = {
             match create_and_assign_sidecar_job(child.pid()) {
@@ -274,7 +308,7 @@ impl CoreManager {
                         };
                         Logger::global().writer_sidecar_log(Level::Info, &message);
                         CLASH_LOGGER.clear_logs();
-                        manager.clear_terminated_sidecar(pid).await;
+                        manager.clear_terminated_sidecar(core_readiness_generation).await;
                         break;
                     }
                     _ => {}
@@ -302,9 +336,12 @@ impl CoreManager {
             };
         }
 
-        #[cfg(target_os = "windows")]
-        self.set_job_handle(Some(job));
-        self.set_running_child_sidecar(child);
+        self.sidecar.lock().process = Some(SidecarProcess {
+            generation: core_readiness_generation,
+            child,
+            #[cfg(target_os = "windows")]
+            job,
+        });
         self.core_started(RunningMode::Sidecar);
         self.restore_selected_nodes().await;
 
@@ -314,18 +351,13 @@ impl CoreManager {
     /// Terminates the sidecar after its caller has successfully cleared the
     /// system proxy.
     pub(super) async fn stop_core_by_sidecar_unprepared(&self) -> Result<()> {
-        if let Some(child) = self.take_child_sidecar() {
-            let pid = child.pid();
-
+        let process = self.sidecar.lock().process.take();
+        if let Some(process) = process {
+            let pid = process.child.pid();
             #[cfg(target_os = "windows")]
-            {
-                // Setting the job handle to None clears the stored handle and
-                // closes the previous Windows job handle in `set_job_handle`.
-                self.set_job_handle(None);
-                let _ = pid;
-            }
+            drop(process.job);
 
-            if let Err(error) = child.kill() {
+            if let Err(error) = process.child.kill() {
                 logging!(warn, Type::Core, "failed to terminate sidecar PID {pid}: {error:#}");
             }
         }
@@ -335,15 +367,15 @@ impl CoreManager {
     }
 
     async fn wait_for_sidecar_exit(&self) -> Result<()> {
-        let mut exit = self.sidecar_exit.lock().await;
-        if let Some(task) = exit.as_mut() {
-            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        // The lifecycle lock serializes callers. Keep a receipt in the session across timeouts.
+        let exit = self.sidecar.lock().exit.clone();
+        if let Some(exit) = exit {
+            tokio::time::timeout(std::time::Duration::from_secs(5), exit)
                 .await
                 .context("Sidecar has not exited; core handoff is blocked")?
                 .context("Sidecar exit monitoring failed")?;
-            exit.take();
+            self.sidecar.lock().exit.take();
         }
-        drop(exit);
         Ok(())
     }
 
@@ -392,15 +424,17 @@ impl CoreManager {
         Ok(())
     }
 
-    async fn clear_terminated_sidecar(&self, terminated_pid: u32) {
+    async fn clear_terminated_sidecar(&self, terminated_generation: u64) {
         let _life = self.lifecycle_lock.lock().await;
-        if !should_clear_terminated_sidecar(&self.get_running_mode(), self.get_running_sidecar_pid(), terminated_pid) {
-            return;
-        }
-
-        let _ = self.take_child_sidecar();
-        #[cfg(target_os = "windows")]
-        self.set_job_handle(None);
+        let process = {
+            let mut session = self.sidecar.lock();
+            let current = session.process.as_ref().map(|process| process.generation);
+            if !should_clear_terminated_sidecar(&self.get_running_mode(), current, terminated_generation) {
+                return;
+            }
+            session.process.take()
+        };
+        drop(process);
         proxy_control::stop_guard().await;
         self.core_stopped();
         #[cfg(target_os = "macos")]

@@ -4,7 +4,7 @@ mod lifecycle;
 mod state;
 
 use anyhow::Result;
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use clash_verge_logging::{LogRing, Type, logging, logging_error};
 use std::{
     fmt,
@@ -14,12 +14,9 @@ use std::{
     },
     time::Instant,
 };
-use tauri_plugin_shell::process::CommandChild;
 
 use crate::core::runstate::{RUN_STATE, RealEnv, RunStateStore};
 use crate::singleton;
-#[cfg(target_os = "windows")]
-use std::os::windows::io::OwnedHandle;
 
 pub(crate) static CLASH_LOGGER: LazyLock<Arc<LogRing>> = LazyLock::new(|| Arc::new(LogRing::new()));
 
@@ -89,14 +86,11 @@ pub struct CoreManager {
     /// A reference rather than the global directly, so a test can supervise a Core without
     /// racing every other test for one process-wide Running Mode.
     run_state: &'static RunStateStore<RealEnv>,
-    state: ArcSwap<State>,
+    sidecar: parking_lot::Mutex<state::SidecarSession>,
     last_update: ArcSwapOption<Instant>,
-    #[cfg(target_os = "windows")]
-    job_handle: ArcSwapOption<OwnedHandle>,
     config_update_in_progress: AtomicBool,
     core_readiness_state: AtomicU64,
     startup_error: parking_lot::Mutex<Option<CoreFailure>>,
-    sidecar_exit: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     // 串行化 start/stop/restart 和 sidecar→service 交接。
     // 锁序固定为 config_update_in_progress → lifecycle_lock。
     pub(crate) lifecycle_lock: tokio::sync::Mutex<()>,
@@ -104,27 +98,15 @@ pub struct CoreManager {
     service_handoff: std::sync::OnceLock<tokio::sync::watch::Sender<Option<u64>>>,
 }
 
-/// Process-level state owned by `CoreManager`.
-///
-/// Running Mode deliberately does *not* live here — it belongs to `core::runstate`, which
-/// keeps it consistent with Service Health and derives PAC availability from it.
-#[derive(Debug, Default)]
-struct State {
-    child_sidecar: ArcSwapOption<CommandChild>,
-}
-
 impl Default for CoreManager {
     fn default() -> Self {
         Self {
             run_state: &RUN_STATE,
-            state: ArcSwap::new(Arc::new(State::default())),
+            sidecar: parking_lot::Mutex::default(),
             last_update: ArcSwapOption::new(None),
-            #[cfg(target_os = "windows")]
-            job_handle: ArcSwapOption::new(None),
             config_update_in_progress: AtomicBool::new(false),
             core_readiness_state: AtomicU64::new(0),
             startup_error: parking_lot::Mutex::new(None),
-            sidecar_exit: tokio::sync::Mutex::new(None),
             lifecycle_lock: tokio::sync::Mutex::new(()),
             #[cfg(target_os = "windows")]
             service_handoff: std::sync::OnceLock::new(),
@@ -159,18 +141,6 @@ impl CoreManager {
 
     pub(crate) fn get_startup_error(&self) -> Option<CoreFailure> {
         self.startup_error.lock().clone()
-    }
-
-    pub fn take_child_sidecar(&self) -> Option<CommandChild> {
-        self.state
-            .load()
-            .child_sidecar
-            .swap(None)
-            .and_then(|arc| Arc::try_unwrap(arc).ok())
-    }
-
-    pub fn get_running_sidecar_pid(&self) -> Option<u32> {
-        self.state.load().child_sidecar.load_full().map(|child| child.pid())
     }
 
     pub fn get_last_update(&self) -> Option<Arc<Instant>> {
@@ -219,11 +189,6 @@ impl CoreManager {
         self.run_state.core_start_settled();
     }
 
-    pub fn set_running_child_sidecar(&self, child: CommandChild) {
-        let state = self.state.load();
-        state.child_sidecar.store(Some(Arc::new(child)));
-    }
-
     fn mark_core_ready(&self) -> u64 {
         let mut current = self.core_readiness_state.load(Ordering::Acquire);
         loop {
@@ -256,17 +221,6 @@ impl CoreManager {
 
     pub fn set_last_update(&self, time: Instant) {
         self.last_update.store(Some(Arc::new(time)));
-    }
-
-    /// Replaces the Windows Job Object handle owned by the core manager
-    ///
-    /// Passing `None` drops the current handle, which closes the Job Object
-    /// and terminates its assigned processes due to `KILL_ON_JOB_CLOSE`.
-    ///
-    /// This method is currently only used on Windows.
-    #[cfg(target_os = "windows")]
-    fn set_job_handle(&self, handle: Option<OwnedHandle>) {
-        self.job_handle.store(handle.map(Arc::new));
     }
 
     pub(crate) fn try_start_config_update(&self) -> bool {
