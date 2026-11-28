@@ -42,12 +42,6 @@ pub mod timing {
     #[cfg(target_os = "windows")]
     pub const SERVICE_WAIT_INTERVAL: Duration = Duration::from_millis(200);
 
-    // 回退 sidecar 后继续等待服务就绪并尝试交接。
-    #[cfg(target_os = "windows")]
-    pub const SERVICE_HANDOFF_WINDOW: Duration = Duration::from_secs(120);
-    #[cfg(target_os = "windows")]
-    pub const SERVICE_HANDOFF_INTERVAL: Duration = Duration::from_secs(2);
-
     // 交接时等待 sidecar 释放 ext-controller 通道。
     #[cfg(target_os = "windows")]
     pub const SERVICE_START_RETRIES: usize = 5;

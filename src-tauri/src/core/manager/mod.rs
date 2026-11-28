@@ -94,8 +94,6 @@ pub struct CoreManager {
     // 串行化 start/stop/restart 和 sidecar→service 交接。
     // 锁序固定为 config_update_in_progress → lifecycle_lock。
     pub(crate) lifecycle_lock: tokio::sync::Mutex<()>,
-    #[cfg(target_os = "windows")]
-    service_handoff: std::sync::OnceLock<tokio::sync::watch::Sender<Option<u64>>>,
 }
 
 impl Default for CoreManager {
@@ -108,8 +106,6 @@ impl Default for CoreManager {
             core_readiness_state: AtomicU64::new(0),
             startup_error: parking_lot::Mutex::new(None),
             lifecycle_lock: tokio::sync::Mutex::new(()),
-            #[cfg(target_os = "windows")]
-            service_handoff: std::sync::OnceLock::new(),
         }
     }
 }
@@ -171,8 +167,6 @@ impl CoreManager {
             logging!(info, Type::Core, "Core running mode changed: {previous} -> NotRunning");
         }
         self.invalidate_core_readiness();
-        #[cfg(target_os = "windows")]
-        self.cancel_service_handoff_watcher();
         self.run_state.core_stopped();
     }
 
