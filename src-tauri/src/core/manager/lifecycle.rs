@@ -690,7 +690,7 @@ impl CoreManager {
 
         #[cfg(target_os = "windows")]
         if matches!(*self.get_running_mode(), RunningMode::Sidecar) {
-            self.spawn_service_handoff_watcher().await;
+            self.start_service_handoff_watcher().await;
         }
 
         result
@@ -885,62 +885,99 @@ impl CoreManager {
     }
 
     #[cfg(target_os = "windows")]
-    async fn spawn_service_handoff_watcher(&self) {
-        use crate::constants::timing;
-        use crate::process::AsyncHandler;
-        use std::sync::atomic::Ordering;
-        use std::time::Instant;
-
-        // An accepted Sidecar is the user's decision for this session, not a wait for the Service.
+    async fn start_service_handoff_watcher(&self) {
+        // An accepted Sidecar is the user's decision for this session.
         let needs_service = Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false)
             && !crate::core::runstate::RUN_STATE.state().sidecar_allowed;
-        if !needs_service {
-            return;
+        if needs_service && let Some(generation) = self.current_core_readiness_generation() {
+            let handoff = self.service_handoff.get_or_init(|| {
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                crate::AsyncHandler::start_driver((
+                    sender,
+                    clash_verge_task::watch_task::run(receiver, Self::monitor_service_handoff, |generation| {
+                        logging!(
+                            error,
+                            Type::Core,
+                            "service handoff watcher panicked (generation {generation})"
+                        );
+                    }),
+                ))
+            });
+            handoff.send_if_modified(|current| {
+                if *current == Some(generation) {
+                    return false;
+                }
+                *current = Some(generation);
+                true
+            });
         }
+    }
 
-        if self.handoff_watcher_running.swap(true, Ordering::AcqRel) {
-            return;
+    #[cfg(target_os = "windows")]
+    pub(super) fn cancel_service_handoff_watcher(&self) {
+        if let Some(handoff) = self.service_handoff.get() {
+            handoff.send_if_modified(|current| current.take().is_some());
         }
+    }
 
+    #[cfg(target_os = "windows")]
+    async fn monitor_service_handoff(generation: u64, mut updates: tokio::sync::watch::Receiver<Option<u64>>) {
+        use crate::constants::timing;
+
+        let manager = Self::global();
+        let started = tokio::time::Instant::now();
         logging!(
             info,
             Type::Core,
             "service not ready at startup; sidecar active, watching for handoff"
         );
+        loop {
+            if started.elapsed() >= timing::SERVICE_HANDOFF_WINDOW {
+                logging!(
+                    info,
+                    Type::Core,
+                    "service handoff window elapsed; staying in sidecar mode"
+                );
+                return;
+            }
 
-        AsyncHandler::spawn(|| async move {
-            let manager = Self::global();
-            let started = Instant::now();
-            use crate::utils::retry::{RetryError, RetryPolicy, retry};
-            let attempts = std::num::NonZeroUsize::MIN.saturating_add(
-                (timing::SERVICE_HANDOFF_WINDOW.as_millis() / timing::SERVICE_HANDOFF_INTERVAL.as_millis()) as usize,
-            );
-            let _ = retry(RetryPolicy::fixed(attempts, std::time::Duration::ZERO), |_| async {
-                if started.elapsed() >= timing::SERVICE_HANDOFF_WINDOW {
-                    logging!(
-                        info,
-                        Type::Core,
-                        "service handoff window elapsed; staying in sidecar mode"
-                    );
-                    return Ok(());
+            tokio::select! {
+                biased;
+                _ = updates.changed() => return,
+                () = tokio::time::sleep(timing::SERVICE_HANDOFF_INTERVAL) => {}
+            }
+
+            // A probe can clear the user-approved Sidecar allowance.
+            if !manager.is_current_handoff_sidecar(generation)
+                || crate::core::runstate::RUN_STATE.state().sidecar_allowed
+            {
+                return;
+            }
+            let ready = tokio::select! {
+                biased;
+                _ = updates.changed() => return,
+                ready = Self::refresh_service_readiness_for_handoff() => ready,
+            };
+            if !ready {
+                continue;
+            }
+
+            // Finish an issued transition even if the plan changes.
+            match manager.try_handoff_sidecar_to_service(generation).await {
+                HandoffOutcome::Done => return,
+                HandoffOutcome::Failed => {
+                    logging!(warn, Type::Core, "handoff attempt failed; staying in sidecar mode");
+                    return;
                 }
-                // The window is checked before waiting, including the final handoff attempt.
-                tokio::time::sleep(timing::SERVICE_HANDOFF_INTERVAL).await;
-                if !matches!(*manager.get_running_mode(), RunningMode::Sidecar) {
-                    return Ok(());
-                }
-                match manager.try_handoff_sidecar_to_service().await {
-                    HandoffOutcome::Done => Ok(()),
-                    HandoffOutcome::Failed => {
-                        logging!(warn, Type::Core, "handoff attempt failed; staying in sidecar mode");
-                        Ok(())
-                    }
-                    HandoffOutcome::NotReady => Err(RetryError::Retry(())),
-                }
-            })
-            .await;
-            manager.handoff_watcher_running.store(false, Ordering::Release);
-        });
+                HandoffOutcome::NotReady => {}
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn is_current_handoff_sidecar(&self, generation: u64) -> bool {
+        matches!(*self.get_running_mode(), RunningMode::Sidecar)
+            && self.current_core_readiness_generation() == Some(generation)
     }
 
     #[cfg(target_os = "windows")]
@@ -953,15 +990,7 @@ impl CoreManager {
 
     #[cfg(target_os = "windows")]
     #[tracing::instrument(skip_all, level = "debug", fields(outcome = tracing::field::Empty))]
-    async fn try_handoff_sidecar_to_service(&self) -> HandoffOutcome {
-        // Before probing: a probe reply records an observation, which clears sidecar_allowed.
-        if crate::core::runstate::RUN_STATE.state().sidecar_allowed {
-            return HandoffOutcome::Done;
-        }
-        if !Self::refresh_service_readiness_for_handoff().await {
-            return HandoffOutcome::NotReady;
-        }
-
+    async fn try_handoff_sidecar_to_service(&self, generation: u64) -> HandoffOutcome {
         if !self.try_start_config_update() {
             return HandoffOutcome::NotReady;
         }
@@ -972,8 +1001,8 @@ impl CoreManager {
         // Lock order is config then lifecycle.
         let _life = self.lifecycle_lock.lock().await;
 
-        if !matches!(*self.get_running_mode(), RunningMode::Sidecar)
-            || !Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false)
+        if !Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false)
+            || !self.is_current_handoff_sidecar(generation)
             || crate::core::runstate::RUN_STATE.state().sidecar_allowed
         {
             return HandoffOutcome::Done;
