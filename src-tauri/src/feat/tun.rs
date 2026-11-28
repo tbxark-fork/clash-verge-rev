@@ -4,18 +4,36 @@ use crate::core::notify::NoticeStatus;
 
 use std::{
     mem::DropGuard,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use clash_verge_logging::{Type, logging};
+use clash_verge_task::scheduled_task::{self, CoalescingJob};
 
 use crate::{
     config::{Config, IVerge},
     core::{handle::Handle, manager::RunningMode, runstate::RUN_STATE},
+    process::AsyncHandler,
 };
 
 /// Prevents recursive runtime disable writes.
 static DISABLING_TUN: AtomicBool = AtomicBool::new(false);
+
+static TUN_RECONCILE: LazyLock<CoalescingJob> = LazyLock::new(|| {
+    AsyncHandler::start_driver(scheduled_task::coalescing(reconcile_tun_availability, || {
+        logging!(error, Type::Core, "TUN reconciliation panicked");
+    }))
+});
+
+pub(crate) fn request_tun_reconciliation() {
+    // The internal disable can publish Run State as part of its own effects.
+    if !DISABLING_TUN.load(Ordering::Acquire) {
+        TUN_RECONCILE.request();
+    }
+}
 
 /// Turn TUN off when startup confirms the Service is absent, so the Core can start on Sidecar.
 ///
@@ -61,7 +79,7 @@ pub async fn reconcile_tun_availability() {
         return;
     }
 
-    // The flag coalesces newly spawned tasks while the config lock serializes writers.
+    // Suppress recursive requests while the config lock serializes writers.
     DISABLING_TUN.store(true, Ordering::Release);
     let _disabling_tun = DropGuard::new((), |()| {
         DISABLING_TUN.store(false, Ordering::Release);
